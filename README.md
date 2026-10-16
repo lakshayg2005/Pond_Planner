@@ -220,6 +220,25 @@ nohup venv/bin/uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port 3000
 
 In the course deployment the container's port 3000 is exposed as 3305.
 
+## Observability (OpenTelemetry)
+
+The backend and the browser emit traces, metrics and logs with OpenTelemetry.
+
+```
+browser (OTel Web SDK) --traceparent--> FastAPI app (OTel SDK) --OTLP/HTTP--> Collector --> OpenObserve (UI)
+```
+
+* Backend set-up: `backend/app/telemetry.py` (FastAPI, httpx, logging and process
+  metrics instrumentation, one span per pipeline stage, `pond.*` metrics).
+* Browser: `frontend/src/telemetry.js`; spans are posted to `/otel/v1/traces` and
+  forwarded to the collector by the backend.
+* Enabled by the standard variables `OTEL_SERVICE_NAME` and
+  `OTEL_EXPORTER_OTLP_ENDPOINT`; without an endpoint nothing is exported, but
+  console logs still carry `trace_id`. `POND_OTEL_CONSOLE=1` prints spans to stdout.
+* Collector config and start scripts: `observability/`. In the course deployment the
+  collector and OpenObserve run on a second container; the UI is at
+  `http://10.1.75.51:3306`.
+
 ## Project structure
 
 ```
