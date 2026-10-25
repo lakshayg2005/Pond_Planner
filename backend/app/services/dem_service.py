@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -12,13 +13,17 @@ from pathlib import Path
 import httpx
 import numpy as np
 import shapely
+from opentelemetry import trace
 from PIL import Image
 from pyproj import CRS, Transformer
 from scipy.ndimage import map_coordinates
 from shapely.geometry import Polygon, shape
 from shapely.ops import transform as shapely_transform
 
+from ..telemetry import in_current_context, tile_requests, tracer
 from .terrain_service import TerrainResult, _calculate_slope_percent, _utm_crs
+
+logger = logging.getLogger(__name__)
 
 # AWS Open Data "Terrain Tiles": global, free, no API key. Terrarium encoding.
 TILE_URL = (
@@ -204,9 +209,16 @@ def _load_tile(zoom: int, x: int, y: int) -> np.ndarray:
         except Exception as exc:  # network / HTTP error
             last_error = exc
     else:
+        tile_requests.add(1, {"result": "failed"})
+        logger.error(
+            "Elevation tile %s/%s/%s could not be downloaded: %s",
+            zoom, x, y, last_error,
+        )
         raise TileFetchError(
             f"Could not download elevation tile {zoom}/{x}/{y}: {last_error}"
         )
+
+    tile_requests.add(1, {"result": "downloaded"})
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -236,12 +248,17 @@ async def _download_tiles(coords: list[tuple[int, int, int]]) -> None:
         async def fetch(zoom: int, x: int, y: int) -> None:
             url = TILE_URL.format(z=zoom, x=x, y=y)
             async with gate:
-                for _ in range(4):
+                for attempt in range(4):
                     try:
                         response = await client.get(url)
                         response.raise_for_status()
-                    except Exception:
+                    except Exception as exc:
+                        logger.warning(
+                            "Tile %s/%s/%s attempt %d failed: %r",
+                            zoom, x, y, attempt + 1, exc,
+                        )
                         continue
+                    tile_requests.add(1, {"result": "downloaded"})
                     try:
                         path = _tile_path(zoom, x, y)
                         path.parent.mkdir(parents=True, exist_ok=True)
@@ -255,12 +272,24 @@ async def _download_tiles(coords: list[tuple[int, int, int]]) -> None:
 
 def _download_missing(coords: list[tuple[int, int, int]]) -> None:
     missing = [c for c in coords if not _tile_path(*c).exists()]
-    if not missing:
-        return
-    try:
-        asyncio.run(_download_tiles(missing))
-    except RuntimeError:
-        pass  # already inside an event loop; the sync fallback handles it
+    cached = len(coords) - len(missing)
+    if cached:
+        tile_requests.add(cached, {"result": "cache_hit"})
+
+    with tracer.start_as_current_span("tiles.download") as span:
+        span.set_attribute("pond.tiles.needed", len(coords))
+        span.set_attribute("pond.tiles.cached", cached)
+        span.set_attribute("pond.tiles.missing", len(missing))
+        if not missing:
+            return
+        logger.info(
+            "Downloading %d of %d elevation tiles (%d cached)",
+            len(missing), len(coords), cached,
+        )
+        try:
+            asyncio.run(_download_tiles(missing))
+        except RuntimeError:
+            pass  # already inside an event loop; the sync fallback handles it
 
 
 def _prune_cache() -> None:
@@ -355,10 +384,19 @@ def build_terrain_from_polygon(
         for tx in range(tx0, tx1 + 1)
     ]
 
+    span = trace.get_current_span()
+    span.set_attribute("pond.area_km2", round(area_km2, 3))
+    span.set_attribute("pond.grid.resolution_m", round(resolution, 1))
+    span.set_attribute("pond.grid.cells", rows * cols)
+    span.set_attribute("pond.tiles.zoom", zoom)
+    span.set_attribute("pond.tiles.count", tile_count)
+
     _download_missing(coords)
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        tiles = list(pool.map(lambda c: _load_tile(*c), coords))
+    with tracer.start_as_current_span("tiles.decode_and_stitch"):
+        load = in_current_context(lambda c: _load_tile(*c))
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            tiles = list(pool.map(load, coords))
 
     mosaic = np.zeros(
         ((ty1 - ty0 + 1) * TILE_SIZE, (tx1 - tx0 + 1) * TILE_SIZE),

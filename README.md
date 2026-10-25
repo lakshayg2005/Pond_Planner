@@ -4,6 +4,11 @@ Given a piece of land, this system suggests where a farm pond should go, outline
 the land that drains into it (the **catchment**), and estimates how much water it
 can collect in a year.
 
+In Chhattisgarh, candidate sites are ranked by a **machine-learning model trained on
+1,063 real village ponds mapped in OpenStreetMap**. On districts it never saw during
+training it scores **ROC-AUC 0.70, against 0.51 for the hand-tuned formula it replaced**
+(details: [AI: learned site suitability](#ai-learned-site-suitability)).
+
 Two ways to use it:
 
 | Mode | Input | Terrain comes from |
@@ -27,7 +32,8 @@ polygon or KML/KMZ
  fill sinks -> D8 flow direction -> flow accumulation
       |
       v
- rank pond sites (gentle slope + high water supply + basin shape, not a channel)
+ rank pond sites: ML model in Chhattisgarh, hand-weighted formula elsewhere
+ (both keep the hard rules: slope limit, minimum runoff, not a drainage channel)
       |
       v
  catchment of each site = all cells whose flow ends at the site
@@ -42,8 +48,10 @@ polygon or KML/KMZ
 * **Contour mode:** contour lines are sampled and interpolated into the same kind of grid.
 * **Hydrology:** depressions are filled, each cell drains to its steepest downhill
   neighbour (D8), and flow is accumulated to find where water gathers.
-* **Site ranking:** cells are scored on runoff supply, low slope, local basin shape and
-  relief; strong drainage channels are rejected. Candidates are spaced apart.
+* **Site ranking:** cells that pass the hard rules (slope limit, minimum runoff, not a
+  strong drainage channel) are ranked by the learned model inside Chhattisgarh, and by a
+  hand-weighted formula (runoff supply, low slope, basin shape, relief) elsewhere.
+  Candidates are spaced apart.
 * **Rainfall:** looked up automatically (NASA POWER 20-year climatology, or Open-Meteo
   ERA5 as a fallback, cached per 0.25 degree cell). It can be overridden.
 * **Contours (draw mode):** contour lines shown on the map are generated from the same
@@ -62,6 +70,42 @@ polygon or KML/KMZ
 | "Water per year" is total runoff reaching the site | Evaporation and seepage are not subtracted; the pond can refill several times a year |
 
 ---
+
+## AI: learned site suitability
+
+The original ranking was a hand-weighted formula. Scored against where villages
+actually built ponds, it turned out to be **no better than chance** (ROC-AUC 0.50). It
+was replaced, for Chhattisgarh, by a gradient-boosted tree model that learned from real
+ponds.
+
+| | |
+|---|---|
+| **Labels** | 1,063 village ponds and tanks (0.1-20 ha) from OpenStreetMap in 9 districts; 3,189 random points at least 250 m from any mapped water |
+| **Features** | 10 terrain descriptors computed by the app's own pipeline: topographic position at 150/500 m, slope in rings 60-200 m and 200-500 m around the point, relief, ruggedness, upstream area, wetness index. They describe the *surroundings* on purpose, so the model cannot cheat by recognising the flat surface of an existing pond |
+| **Model** | scikit-learn `HistGradientBoostingClassifier` (200 trees, depth 4), exported to a 227 KB JSON file and evaluated with plain NumPy on the server, so the 512 MB host never loads scikit-learn. A test checks that the export reproduces scikit-learn's predictions exactly |
+| **Evaluation** | Trained on 6 districts. The 3 test districts (Mahasamund, Janjgir-Champa, Rajnandgaon) were fixed before any results were seen, share no land with the training districts, and were scored once |
+
+Results on the held-out districts (399 ponds, 1,596 samples):
+
+| Metric | Learned model | Hand-tuned formula | Random |
+|---|---|---|---|
+| ROC-AUC | **0.697** | 0.505 | 0.50 |
+| Precision-recall AUC | **0.477** | 0.260 | 0.25 |
+| Top-10 sites within 100 m of a real pond | **9.3%** | 6.4% | 4.5% |
+
+Leave-one-district-out cross-validation on the training districts gave ROC-AUC 0.702,
+consistent with the held-out score. The model beats the formula in every test district
+(0.65 / 0.72 / 0.70 vs 0.51 / 0.50 / 0.52). Scoring adds no measurable time to an
+analysis (2.34 s vs 2.38 s on a 36,600-cell area).
+
+**Scope.** The model is used only inside Chhattisgarh; elsewhere the app falls back to
+the formula. An all-India version trained on 8 regions did *not* generalise (ROC-AUC
+0.52): ponds in the Kolar tank cascades sit in valleys, while those on the Chhattisgarh
+plains sit on gentle slopes, and in Bankura they are dug next to villages regardless of
+terrain. `POND_RANKING=heuristic` forces the formula everywhere.
+
+Method, scripts and full results: [ml/README.md](ml/README.md). Map data
+(c) OpenStreetMap contributors, ODbL.
 
 ## API
 
@@ -220,6 +264,25 @@ nohup venv/bin/uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port 3000
 
 In the course deployment the container's port 3000 is exposed as 3305.
 
+## Observability (OpenTelemetry)
+
+The backend and the browser emit traces, metrics and logs with OpenTelemetry.
+
+```
+browser (OTel Web SDK) --traceparent--> FastAPI app (OTel SDK) --OTLP/HTTP--> Collector --> OpenObserve (UI)
+```
+
+* Backend set-up: `backend/app/telemetry.py` (FastAPI, httpx, logging and process
+  metrics instrumentation, one span per pipeline stage, `pond.*` metrics).
+* Browser: `frontend/src/telemetry.js`; spans are posted to `/otel/v1/traces` and
+  forwarded to the collector by the backend.
+* Enabled by the standard variables `OTEL_SERVICE_NAME` and
+  `OTEL_EXPORTER_OTLP_ENDPOINT`; without an endpoint nothing is exported, but
+  console logs still carry `trace_id`. `POND_OTEL_CONSOLE=1` prints spans to stdout.
+* Collector config and start scripts: `observability/`. In the course deployment the
+  collector and OpenObserve run on a second container; the UI is at
+  `http://10.1.75.51:3306`.
+
 ## Project structure
 
 ```
@@ -235,6 +298,8 @@ backend/app/
     flow_service.py          sink filling, D8 flow direction
     accumulation_service.py  flow accumulation
     suitability_service.py   pond site ranking
+    site_features.py         terrain features for the learned model
+    site_model.py            learned site model (NumPy evaluation of exported trees)
     catchment_service.py     catchment delineation
     analysis_pipeline.py     shared hydrology pipeline for both routes
     rainfall_service.py      rainfall lookup, caching, fallbacks
@@ -245,6 +310,8 @@ frontend/src/
   App.jsx                    state and layout
   components/                MapView, Sidebar, ResultsPanel, PlaceSearch
   services/api.js            API client
+backend/app/models/          site_model.json (trained model)
+ml/                          training data, scripts and results for the site model
 tests/                       pytest suite
 ```
 

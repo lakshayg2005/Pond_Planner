@@ -1,3 +1,5 @@
+import { withSpan } from "../telemetry";
+
 const API_URL = (import.meta.env.VITE_API_URL ?? "").replace(/\/$/, "");
 
 function describeError(data, status) {
@@ -58,12 +60,17 @@ export function analyzeArea(ring, params, signal) {
   if (params.rainfall) body.rainfall_mm = params.rainfall;
   if (params.runoff) body.runoff_coefficient = params.runoff;
 
-  return request("/api/analyze-area", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal,
-  });
+  return withSpan(
+    "ui.analyze_area",
+    { "pond.vertices": ring.length - 1, "pond.max_candidates": params.maxPonds },
+    () =>
+      request("/api/analyze-area", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal,
+      })
+  );
 }
 
 /** Analyse an uploaded KML/KMZ contour map. */
@@ -78,11 +85,16 @@ export function analyzeContourFile(file, params, signal) {
   const form = new FormData();
   form.append("contour_map", file);
 
-  return request(`/api/catchment/analyze?${query}`, {
-    method: "POST",
-    body: form,
-    signal,
-  });
+  return withSpan(
+    "ui.analyze_contour_file",
+    { "pond.upload.filename": file.name, "pond.upload.bytes": file.size },
+    () =>
+      request(`/api/catchment/analyze?${query}`, {
+        method: "POST",
+        body: form,
+        signal,
+      })
+  );
 }
 
 export async function fetchServerInfo() {

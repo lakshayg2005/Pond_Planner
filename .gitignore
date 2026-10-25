@@ -19,3 +19,8 @@ Thumbs.db
 
 # Downloaded elevation tile cache
 backend/.tile_cache/
+
+# ML training artefacts that can be regenerated (ml/build_dataset.py)
+ml/data/elevation_cache/
+ml/data/tiles_*/
+ml/data/build*.log

@@ -1,14 +1,27 @@
 from __future__ import annotations
 
+import logging
+import time
+
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from opentelemetry import trace
 
 from ...schemas.catchment import CatchmentAnalyzeResponse
-from ...services.analysis_pipeline import run_hydrology
+from ...services.analysis_pipeline import run_hydrology, stage
 from ...services.concurrency import run_exclusive
 from ...services.kml_parser import parse_kml_bytes
 from ...services.rainfall_service import lookup_async, manual_rainfall
 from ...services.terrain_service import reconstruct_dem
+from ...telemetry import (
+    analysis_counter,
+    analysis_duration,
+    annual_runoff,
+    candidates_found,
+    grid_cells,
+    rainfall_lookups,
+)
 
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/catchment",
@@ -82,7 +95,11 @@ async def analyze_catchment(
     # Validate file extension
     # =========================================================
 
+    span = trace.get_current_span()
+    request_started = time.perf_counter()
+
     filename = contour_map.filename or ""
+    span.set_attribute("pond.upload.filename", filename)
 
     extension = (
         "." + filename.rsplit(".", 1)[-1].lower()
@@ -91,6 +108,8 @@ async def analyze_catchment(
     )
 
     if extension not in _ALLOWED_EXTENSIONS:
+        analysis_counter.add(1, {"mode": "contour", "outcome": "bad_file_type"})
+        logger.warning("Rejected upload %r: not a .kml/.kmz file", filename)
         raise HTTPException(
             status_code=400,
             detail="Only .kml and .kmz files are supported",
@@ -101,7 +120,10 @@ async def analyze_catchment(
         # without buffering them entirely.
         data = await contour_map.read(MAX_UPLOAD_BYTES + 1)
 
+        span.set_attribute("pond.upload.bytes", len(data))
         if len(data) > MAX_UPLOAD_BYTES:
+            analysis_counter.add(1, {"mode": "contour", "outcome": "too_large"})
+            logger.warning("Rejected upload %r: larger than the limit", filename)
             raise HTTPException(
                 status_code=413,
                 detail=(
@@ -113,7 +135,13 @@ async def analyze_catchment(
         if not data:
             raise ValueError("Uploaded file is empty")
 
-        contours = parse_kml_bytes(data, filename)
+        with stage("kml.parse") as parse_span:
+            contours = parse_kml_bytes(data, filename)
+            parse_span.set_attribute("pond.contours.count", len(contours))
+        logger.info(
+            "Contour analysis started: %r, %d bytes, %d contour lines",
+            filename, len(data), len(contours),
+        )
 
         if not contours:
             raise ValueError(
@@ -129,12 +157,17 @@ async def analyze_catchment(
         centre_lat = (min(lats) + max(lats)) / 2.0
 
         if rainfall_mm is not None:
+            rainfall_lookups.add(1, {"source": "user_supplied"})
             rainfall_source = manual_rainfall(rainfall_mm)
         else:
             rainfall_source = lookup_async(centre_lat, centre_lon)
 
+        def reconstruct(*args, **kwargs):
+            with stage("terrain.reconstruct_from_contours"):
+                return reconstruct_dem(*args, **kwargs)
+
         terrain = await run_exclusive(
-            reconstruct_dem,
+            reconstruct,
             contours,
             grid_resolution_m=grid_resolution_m,
             sample_spacing_m=sample_spacing_m,
@@ -184,6 +217,26 @@ async def analyze_catchment(
 
         height, width = (
             terrain.elevation_grid_m.shape
+        )
+
+        elapsed = time.perf_counter() - request_started
+        analysis_counter.add(1, {"mode": "contour", "outcome": "success"})
+        analysis_duration.record(elapsed, {"mode": "contour"})
+        candidates_found.record(len(candidates), {"mode": "contour"})
+        grid_cells.record(cell_count, {"mode": "contour"})
+        span.set_attribute("pond.outcome", "success")
+        span.set_attribute("pond.candidates.found", len(candidates))
+        span.set_attribute("pond.contour_rmse_m", float(terrain.contour_rmse_m))
+        if candidate_responses and candidate_responses[0]["volume"]:
+            annual_runoff.record(
+                candidate_responses[0]["volume"]["annual_runoff_m3"],
+                {"mode": "contour"},
+            )
+        logger.info(
+            "Contour analysis done in %.1f s: %d cells at %.0f m, %d ponds, "
+            "contour RMSE %.2f m, rainfall %.0f mm (%s)",
+            elapsed, cell_count, terrain.grid_resolution_m, len(candidates),
+            terrain.contour_rmse_m, rainfall.annual_mm, rainfall.source,
         )
 
         # =====================================================
@@ -371,16 +424,25 @@ async def analyze_catchment(
             },
         )
 
-    except HTTPException:
+    except HTTPException as exc:
+        if exc.status_code >= 500:
+            analysis_counter.add(
+                1, {"mode": "contour", "outcome": f"http_{exc.status_code}"}
+            )
         raise
 
     except ValueError as exc:
+        analysis_counter.add(1, {"mode": "contour", "outcome": "invalid_file"})
+        span.record_exception(exc)
+        logger.warning("Contour file %r rejected: %s", filename, exc)
         raise HTTPException(
             status_code=422,
             detail=str(exc),
         ) from exc
 
     except Exception as exc:
+        analysis_counter.add(1, {"mode": "contour", "outcome": "error"})
+        logger.exception("Contour analysis of %r failed", filename)
         raise HTTPException(
             status_code=500,
             detail=f"Terrain analysis failed: {exc}",

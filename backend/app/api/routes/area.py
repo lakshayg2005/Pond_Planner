@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 import time
 
 from fastapi import APIRouter, HTTPException
+from opentelemetry import trace
 
 from ...schemas.area import AreaAnalyzeRequest, AreaAnalyzeResponse
-from ...services.analysis_pipeline import run_hydrology
+from ...services.analysis_pipeline import run_hydrology, stage
 from ...services.concurrency import run_exclusive
 from ...services.contour_service import dem_contours
 from ...services.dem_service import (
@@ -16,6 +18,17 @@ from ...services.dem_service import (
     polygon_mask,
 )
 from ...services.rainfall_service import lookup_async, manual_rainfall
+from ...telemetry import (
+    analysis_counter,
+    analysis_duration,
+    annual_runoff,
+    area_km2,
+    candidates_found,
+    grid_cells,
+    rainfall_lookups,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api",
@@ -27,8 +40,10 @@ def _analyse(request: AreaAnalyzeRequest, polygon, rainfall_source):
     started = time.perf_counter()
     timings: dict[str, float] = {}
 
-    terrain, dem_info = build_terrain_from_polygon(polygon)
-    mask = polygon_mask(terrain, polygon)
+    with stage("terrain.build"):
+        terrain, dem_info = build_terrain_from_polygon(polygon)
+    with stage("terrain.polygon_mask"):
+        mask = polygon_mask(terrain, polygon)
     timings["terrain_s"] = time.perf_counter() - started
 
     if not mask.any():
@@ -59,7 +74,9 @@ def _analyse(request: AreaAnalyzeRequest, polygon, rainfall_source):
     )
 
     contours_started = time.perf_counter()
-    contours, contour_interval = dem_contours(terrain)
+    with stage("contours.generate") as span:
+        contours, contour_interval = dem_contours(terrain)
+        span.set_attribute("pond.contours.interval_m", float(contour_interval))
     output.map_data["contours"] = contours
     timings["contours_s"] = time.perf_counter() - contours_started
 
@@ -77,17 +94,32 @@ def _analyse(request: AreaAnalyzeRequest, polygon, rainfall_source):
     response_model=AreaAnalyzeResponse,
 )
 async def analyze_area(request: AreaAnalyzeRequest) -> AreaAnalyzeResponse:
+    span = trace.get_current_span()
+    request_started = time.perf_counter()
+
+    def failed(status: int, outcome: str, exc: Exception) -> HTTPException:
+        analysis_counter.add(1, {"mode": "area", "outcome": outcome})
+        span.set_attribute("pond.outcome", outcome)
+        span.record_exception(exc)
+        logger.warning("Area analysis rejected (%d %s): %s", status, outcome, exc)
+        return HTTPException(status_code=status, detail=str(exc))
+
     try:
         polygon = parse_polygon(request.polygon)
     except AreaError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise failed(422, "invalid_area", exc) from exc
 
     centroid = polygon.centroid
-
-    request_started = time.perf_counter()
+    span.set_attribute("pond.centroid.lat", round(centroid.y, 5))
+    span.set_attribute("pond.centroid.lon", round(centroid.x, 5))
+    logger.info(
+        "Area analysis started at (%.4f, %.4f), max_candidates=%d",
+        centroid.y, centroid.x, request.max_candidates,
+    )
 
     # The lookup starts now and runs while the terrain is being processed.
     if request.rainfall_mm is not None:
+        rainfall_lookups.add(1, {"source": "user_supplied"})
         rainfall_source = lambda: manual_rainfall(request.rainfall_mm)  # noqa: E731
     else:
         rainfall_source = lookup_async(centroid.y, centroid.x)
@@ -98,9 +130,12 @@ async def analyze_area(request: AreaAnalyzeRequest) -> AreaAnalyzeResponse:
             contour_interval, timings,
         ) = await run_exclusive(_analyse, request, polygon, rainfall_source)
     except AreaError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise failed(422, "invalid_area", exc) from exc
     except TileFetchError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise failed(502, "tile_download_failed", exc) from exc
+    except HTTPException as exc:
+        analysis_counter.add(1, {"mode": "area", "outcome": f"http_{exc.status_code}"})
+        raise
 
     rainfall = output.rainfall
     timings["total_s"] = time.perf_counter() - request_started
@@ -108,6 +143,27 @@ async def analyze_area(request: AreaAnalyzeRequest) -> AreaAnalyzeResponse:
 
     candidates = output.candidate_responses
     best = candidates[0] if candidates else None
+
+    analysis_counter.add(1, {"mode": "area", "outcome": "success"})
+    analysis_duration.record(timings["total_s"], {"mode": "area"})
+    candidates_found.record(len(candidates), {"mode": "area"})
+    grid_cells.record(height * width, {"mode": "area"})
+    area_km2.record(dem_info.area_km2)
+    span.set_attribute("pond.outcome", "success")
+    span.set_attribute("pond.area_km2", round(dem_info.area_km2, 3))
+    span.set_attribute("pond.candidates.found", len(candidates))
+    span.set_attribute("pond.rainfall.annual_mm", round(rainfall.annual_mm, 1))
+    if best:
+        annual_runoff.record(best["volume"]["annual_runoff_m3"], {"mode": "area"})
+        span.set_attribute(
+            "pond.best_site.annual_runoff_m3", best["volume"]["annual_runoff_m3"]
+        )
+    logger.info(
+        "Area analysis done: %.2f km2, %d cells, %d ponds, rainfall %.0f mm (%s), "
+        "timings %s",
+        dem_info.area_km2, height * width, len(candidates),
+        rainfall.annual_mm, rainfall.source, timings,
+    )
 
     summary = {
         "pond_count": len(candidates),

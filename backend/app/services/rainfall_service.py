@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
@@ -9,8 +10,12 @@ from datetime import date
 from pathlib import Path
 
 import httpx
+from opentelemetry import trace
 
+from ..telemetry import in_current_context, rainfall_lookups, tracer
 from .dem_service import CACHE_DIR
+
+logger = logging.getLogger(__name__)
 
 NASA_URL = "https://power.larc.nasa.gov/api/temporal/climatology/point"
 OPEN_METEO_URL = "https://archive-api.open-meteo.com/v1/archive"
@@ -55,6 +60,7 @@ def manual_rainfall(annual_mm: float) -> RainfallResult:
 
 
 def fallback_rainfall() -> RainfallResult:
+    rainfall_lookups.add(1, {"source": "fallback_default"})
     result = manual_rainfall(FALLBACK_ANNUAL_MM)
     result.source = (
         "Rainfall could not be looked up automatically; a default of "
@@ -189,14 +195,23 @@ def get_annual_rainfall(latitude: float, longitude: float) -> RainfallResult:
     lat = round(latitude * 4) / 4
     lon = round(longitude * 4) / 4
     key = _cache_key(lat, lon)
+    span = trace.get_current_span()
+    span.set_attribute("pond.rainfall.cell", key)
 
     cached = _cache_read(key)
     if cached is not None:
+        span.set_attribute("pond.rainfall.cache_hit", True)
+        span.set_attribute("pond.rainfall.source", cached.source)
+        rainfall_lookups.add(1, {"source": "cache"})
         return cached
+    span.set_attribute("pond.rainfall.cache_hit", False)
 
     # Ask every source at once and take the first that answers, so a slow or
     # blocked source cannot hold the request up.
-    futures = {_pool.submit(provider, lat, lon): provider for provider in PROVIDERS}
+    futures = {
+        _pool.submit(in_current_context(_traced_provider), provider, lat, lon): provider
+        for provider in PROVIDERS
+    }
     pending = set(futures)
     failures = []
 
@@ -207,11 +222,27 @@ def get_annual_rainfall(latitude: float, longitude: float) -> RainfallResult:
                 result = future.result()
             except Exception as exc:  # network, HTTP status, bad payload
                 failures.append(f"{futures[future].__name__}: {exc}")
+                logger.warning(
+                    "Rainfall source %s failed for %s: %s",
+                    futures[future].__name__, key, exc,
+                )
                 continue
             _cache_write(key, result)
+            span.set_attribute("pond.rainfall.source", result.source)
+            rainfall_lookups.add(1, {"source": result.source})
+            logger.info(
+                "Rainfall for %s: %.0f mm/year from %s",
+                key, result.annual_mm, result.source,
+            )
             return result
 
+    logger.error("Every rainfall source failed for %s: %s", key, failures)
     raise RainfallError("; ".join(failures))
+
+
+def _traced_provider(provider, lat: float, lon: float) -> RainfallResult:
+    with tracer.start_as_current_span(f"rainfall.{provider.__name__.removeprefix('_from_')}"):
+        return provider(lat, lon)
 
 
 _pool = ThreadPoolExecutor(max_workers=6)
@@ -226,9 +257,16 @@ def lookup_async(latitude: float, longitude: float) -> Callable[[], RainfallResu
     """
 
     def task() -> RainfallResult:
-        try:
-            return get_annual_rainfall(latitude, longitude)
-        except RainfallError:
-            return fallback_rainfall()
+        with tracer.start_as_current_span("rainfall.lookup"):
+            try:
+                return get_annual_rainfall(latitude, longitude)
+            except RainfallError:
+                return fallback_rainfall()
 
-    return _pool.submit(task).result
+    future = _pool.submit(in_current_context(task))
+
+    def result() -> RainfallResult:
+        with tracer.start_as_current_span("rainfall.wait"):
+            return future.result()
+
+    return result
