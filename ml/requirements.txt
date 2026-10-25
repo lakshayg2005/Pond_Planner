@@ -1,0 +1,3 @@
+# Training only (not needed on the server, which runs the exported model with NumPy)
+-r ../backend/requirements.txt
+scikit-learn>=1.5

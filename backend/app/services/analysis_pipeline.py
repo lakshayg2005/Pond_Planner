@@ -21,6 +21,8 @@ from .geojson_service import (
     transform_geojson_to_wgs84,
 )
 from .rainfall_service import RainfallResult
+from .site_features import compute_feature_grid
+from .site_model import get_model
 from .suitability_service import PondCandidate, detect_pond_candidates
 from .terrain_service import TerrainResult
 from .volume_service import estimate_water_volume, suggest_runoff_coefficient
@@ -86,6 +88,29 @@ def run_hydrology(
         # Non-finite slope makes the suitability step skip those cells.
         candidate_slope = np.where(analysis_mask, slope, np.nan)
 
+    learned_score = None
+    model = get_model()
+    west, south, east, north = terrain.bounds_lonlat
+    if model is not None and model.covers((west + east) / 2, (south + north) / 2):
+        with stage("hydrology.learned_site_scoring") as span:
+            # Score only cells that could be selected at all; the model is
+            # the costly part and most cells fail these cheap checks.
+            eligible = (
+                np.isfinite(candidate_slope)
+                & (candidate_slope <= max_slope_percent)
+                & (accumulation >= minimum_accumulation)
+            )
+            features = compute_feature_grid(
+                terrain.elevation_grid_m,
+                slope,
+                accumulation,
+                terrain.grid_resolution_m,
+            )
+            learned_score = np.zeros(slope.shape)
+            learned_score[eligible] = model.predict_proba(features[eligible])
+            span.set_attribute("pond.model.version", model.version)
+            span.set_attribute("pond.model.cells_scored", int(eligible.sum()))
+
     with stage("hydrology.rank_pond_sites") as span:
         candidates = detect_pond_candidates(
             elevation_m=flow.filled_dem_m,
@@ -96,8 +121,12 @@ def run_hydrology(
             minimum_accumulation=minimum_accumulation,
             max_candidates=max_candidates,
             minimum_distance_cells=minimum_distance_cells,
+            learned_score=learned_score,
         )
         span.set_attribute("pond.candidates.found", len(candidates))
+        span.set_attribute(
+            "pond.ranking", "learned" if learned_score is not None else "heuristic"
+        )
         span.set_attribute("pond.max_slope_percent", float(max_slope_percent))
 
     if callable(rainfall):

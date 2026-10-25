@@ -558,18 +558,30 @@ def _build_reason(
     return ", ".join(reasons)
 
 
-def detect_pond_candidates(
+@dataclass(slots=True)
+class HeuristicScores:
+    """Per-cell grids from the hand-weighted suitability formula."""
+
+    score: np.ndarray            # 0 where the cell is not eligible
+    valid: np.ndarray            # eligibility (slope, accumulation, channel)
+    water_supply: np.ndarray
+    slope_score: np.ndarray
+    basin_score: np.ndarray
+    local_relief_score: np.ndarray
+    channel_penalty: np.ndarray
+    non_channel_score: np.ndarray
+
+
+def heuristic_scores(
     elevation_m: np.ndarray,
     slope_percent: np.ndarray,
     flow_accumulation: np.ndarray,
     max_slope_percent: float = 8.0,
     minimum_accumulation: int = 10,
-    max_candidates: int = 10,
-    minimum_distance_cells: int = 10,
     flow_direction: Optional[np.ndarray] = None,
-) -> list[PondCandidate]:
+) -> HeuristicScores:
     """
-    Advanced pond-site detection.
+    Hand-weighted pond-site suitability for every cell.
 
     The algorithm combines:
 
@@ -629,9 +641,6 @@ def detect_pond_candidates(
 
     valid &= slope <= max_slope_percent
     valid &= accumulation >= minimum_accumulation
-
-    if not np.any(valid):
-        return []
 
     # ---------------------------------------------------------
     # 1. Water supply
@@ -721,6 +730,65 @@ def detect_pond_candidates(
 
     score[~valid] = 0.0
 
+    return HeuristicScores(
+        score=score,
+        valid=valid,
+        water_supply=water_supply,
+        slope_score=slope_score,
+        basin_score=basin_score,
+        local_relief_score=local_relief_score,
+        channel_penalty=channel_penalty,
+        non_channel_score=non_channel_score,
+    )
+
+
+def detect_pond_candidates(
+    elevation_m: np.ndarray,
+    slope_percent: np.ndarray,
+    flow_accumulation: np.ndarray,
+    max_slope_percent: float = 8.0,
+    minimum_accumulation: int = 10,
+    max_candidates: int = 10,
+    minimum_distance_cells: int = 10,
+    flow_direction: Optional[np.ndarray] = None,
+    learned_score: Optional[np.ndarray] = None,
+) -> list[PondCandidate]:
+    """
+    Rank pond sites and keep the best ones, spaced apart.
+
+    Cells are eligible only if they pass the hard rules of the
+    hand-weighted formula (slope limit, minimum runoff, not a strong
+    channel). They are then ranked by `learned_score` (the trained
+    site model's probability) when given, else by the formula's score.
+    """
+    elevation = np.asarray(elevation_m, dtype=float)
+    slope = np.asarray(slope_percent, dtype=float)
+    accumulation = np.asarray(flow_accumulation, dtype=float)
+
+    grids = heuristic_scores(
+        elevation,
+        slope,
+        accumulation,
+        max_slope_percent=max_slope_percent,
+        minimum_accumulation=minimum_accumulation,
+        flow_direction=flow_direction,
+    )
+
+    if not np.any(grids.valid):
+        return []
+
+    if learned_score is not None:
+        score = np.where(grids.valid, np.asarray(learned_score, dtype=float), 0.0)
+    else:
+        score = grids.score
+
+    water_supply = grids.water_supply
+    slope_score = grids.slope_score
+    basin_score = grids.basin_score
+    local_relief_score = grids.local_relief_score
+    channel_penalty = grids.channel_penalty
+    non_channel_score = grids.non_channel_score
+
     # ---------------------------------------------------------
     # 6. Candidate extraction
     # ---------------------------------------------------------
@@ -763,7 +831,11 @@ def detect_pond_candidates(
                 local_relief_score=float(
                     local_relief_score[row, col]
                 ),
-                reason=_build_reason(
+                reason=(
+                    f"learned suitability {score[row, col]:.2f}; "
+                    if learned_score is not None
+                    else ""
+                ) + _build_reason(
                     float(water_supply[row, col]),
                     float(basin_score[row, col]),
                     float(local_relief_score[row, col]),
